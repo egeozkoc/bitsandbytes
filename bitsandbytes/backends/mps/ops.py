@@ -22,6 +22,7 @@ from ..default.ops import (
     _try_torch_compile,
 )
 from ..utils import _get_4bit_code
+from . import shaders
 
 _QUANT_MAP = {"fp4": 1, "nf4": 2}
 
@@ -81,9 +82,48 @@ def _quantize_blockwise_compute(
     return lo.to(torch.uint8), absmax
 
 
+def _quantize_blockwise_metal(
+    A_flat: torch.Tensor, code: torch.Tensor, blocksize: int
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Quantize with the JIT-compiled Metal kernel, or return None if unavailable."""
+    lib = shaders.get_library()
+    if lib is None:
+        return None
+
+    n = A_flat.numel()
+    blocks = (n + blocksize - 1) // blocksize
+    threadgroup_size = min(blocksize, shaders.MAX_THREADGROUP_SIZE)
+
+    out = torch.empty(n, dtype=torch.uint8, device=A_flat.device)
+    absmax = torch.empty(blocks, dtype=torch.float32, device=A_flat.device)
+
+    try:
+        lib.quantize_blockwise(
+            A_flat,
+            code,
+            out,
+            absmax,
+            n,
+            blocksize,
+            threads=blocks * threadgroup_size,
+            group_size=threadgroup_size,
+        )
+    except Exception:
+        return None
+
+    return out, absmax
+
+
 @register_kernel("bitsandbytes::quantize_blockwise", "mps")
 def _(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor, torch.Tensor]:
-    q, absmax = _quantize_blockwise_compute(A.reshape(-1).float(), code.float(), blocksize)
+    A_flat = A.reshape(-1).float().contiguous()
+    code = code.float().contiguous()
+
+    result = _quantize_blockwise_metal(A_flat, code, blocksize)
+    if result is None:
+        result = _quantize_blockwise_compute(A_flat, code, blocksize)
+
+    q, absmax = result
     return q.reshape(A.shape), absmax
 
 
