@@ -19,11 +19,12 @@ _SHADER_SOURCE = r"""
 #include <metal_stdlib>
 using namespace metal;
 
-// Per-threadgroup maximum of |A[i]| over one quantization block.
-// Returns the block absmax to every thread in the threadgroup.
-inline float block_absmax(
+// Positive float bit patterns are ordered by magnitude, with NaNs above infinity.
+// Reduce them as integers so max/simd_max cannot silently discard NaNs, even
+// with fast math enabled. Returns the absmax bits to every thread in the group.
+inline uint block_absmax_bits(
     device const float* A,
-    threadgroup float* scratch,
+    threadgroup uint* scratch,
     uint base,
     uint block_end,
     uint tid,
@@ -31,9 +32,9 @@ inline float block_absmax(
     uint simd_lane,
     uint simd_id
 ) {
-    float m = 0.0f;
+    uint m = 0u;
     for (uint i = base + tid; i < block_end; i += tg_size) {
-        m = max(m, fabs(A[i]));
+        m = max(m, as_type<uint>(A[i]) & 0x7fffffffu);
     }
 
     m = simd_max(m);
@@ -44,8 +45,7 @@ inline float block_absmax(
 
     if (simd_id == 0) {
         uint n_simds = (tg_size + 31u) / 32u;
-        // absmax is non-negative, so -1 is a safe identity for inactive lanes.
-        float v = (simd_lane < n_simds) ? scratch[simd_lane] : -1.0f;
+        uint v = (simd_lane < n_simds) ? scratch[simd_lane] : 0u;
         v = simd_max(v);
         if (simd_lane == 0) {
             scratch[0] = v;
@@ -74,7 +74,7 @@ kernel void quantize_blockwise(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id   [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float scratch[MAX_SIMDGROUPS];
+    threadgroup uint scratch[MAX_SIMDGROUPS];
     threadgroup float lcode[256];
 
     for (uint i = tid; i < 256u; i += tg_size) {
@@ -84,16 +84,34 @@ kernel void quantize_blockwise(
     uint base = gid * blocksize;
     uint block_end = min(base + blocksize, n);
 
-    float m = block_absmax(A, scratch, base, block_end, tid, tg_size, simd_lane, simd_id);
+    uint m_bits = block_absmax_bits(A, scratch, base, block_end, tid, tg_size, simd_lane, simd_id);
+    // Preserve the existing MPS fallback: only a partial block stores its
+    // clamped absmax. Integer comparison also preserves subnormal statistics.
+    bool partial = block_end - base < blocksize;
+    if (partial) {
+        m_bits = max(m_bits, as_type<uint>(1e-38f));
+    }
+    float m = as_type<float>(m_bits);
     if (tid == 0) {
         absmax[gid] = m;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if (m_bits > 0x7f800000u) {
+        // A NaN absmax makes every normalized value NaN. All comparisons in
+        // the fallback's midpoint search are then false, selecting code 0.
+        for (uint i = base + tid; i < block_end; i += tg_size) {
+            out[i] = 0;
+        }
+        return;
+    }
+
     float inv = 1.0f / max(m, 1e-38f);
 
     for (uint i = base + tid; i < block_end; i += tg_size) {
-        float x = clamp(A[i] * inv, -1.0f, 1.0f);
+        // The fallback divides partial blocks directly; reciprocal multiply
+        // can round differently at a code boundary.
+        float x = clamp(partial ? precise::divide(A[i], m) : A[i] * inv, -1.0f, 1.0f);
         // Binary search for the first midpoint >= x over the 255 midpoints.
         uint lo = 0u, hi = 255u;
         while (lo < hi) {

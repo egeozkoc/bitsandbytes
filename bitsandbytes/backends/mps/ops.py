@@ -86,11 +86,21 @@ def _quantize_blockwise_metal(
     A_flat: torch.Tensor, code: torch.Tensor, blocksize: int
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Quantize with the JIT-compiled Metal kernel, or return None if unavailable."""
+    n = A_flat.numel()
+    # The shader loads 256 entries and uses uint indexing, including the block
+    # end and loop increments. Keep unsupported inputs on the existing path.
+    if (
+        code.ndim != 1
+        or code.numel() != 256
+        or blocksize <= 0
+        or n > 0xFFFFFFFF - max(blocksize, shaders.MAX_THREADGROUP_SIZE)
+    ):
+        return None
+
     lib = shaders.get_library()
     if lib is None:
         return None
 
-    n = A_flat.numel()
     blocks = (n + blocksize - 1) // blocksize
     threadgroup_size = min(blocksize, shaders.MAX_THREADGROUP_SIZE)
 
